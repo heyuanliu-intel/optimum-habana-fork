@@ -181,6 +181,18 @@ def main():
         "--use_hpu_graphs", action="store_true", help="Use HPU graphs on HPU. This should lead to faster generations."
     )
     parser.add_argument(
+        "--use_compile",
+        action="store_true",
+        help="torch.compile the transformer(s). Compatible with --use_cache_dit (unlike HPU graphs); "
+        "forces use_hpu_graphs off.",
+    )
+    parser.add_argument(
+        "--compile_backend",
+        type=str,
+        default="hpu_backend",
+        help="torch.compile backend (Gaudi: hpu_backend).",
+    )
+    parser.add_argument(
         "--dtype",
         default="bf16",
         choices=["bf16", "fp32", "autocast_bf16"],
@@ -191,6 +203,55 @@ def main():
         type=int,
         default=1,
         help="Number of benchmark loops for generation.",
+    )
+    parser.add_argument(
+        "--use_cache_dit",
+        action="store_true",
+        help="Enable cache_dit (DBCache) block-level caching to accelerate inference. Requires eager mode.",
+    )
+    parser.add_argument(
+        "--cache_threshold",
+        type=float,
+        default=0.24,
+        help="cache_dit residual_diff_threshold (higher caches more: faster, lower fidelity).",
+    )
+    parser.add_argument(
+        "--cache_warmup",
+        type=int,
+        default=8,
+        help="cache_dit global max_warmup_steps (initial steps always computed).",
+    )
+    parser.add_argument(
+        "--cache_fn_blocks",
+        type=int,
+        default=1,
+        help="cache_dit Fn_compute_blocks (leading transformer blocks always computed).",
+    )
+    parser.add_argument(
+        "--cache_warmup_per_transformer",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Per-transformer warmup steps for Wan2.2 [high_noise, low_noise], e.g. 4 2. "
+        "Overrides --cache_warmup via a per-transformer ParamsModifier.",
+    )
+    parser.add_argument(
+        "--cache_threshold_per_transformer",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Per-transformer thresholds aligned to --cache_warmup_per_transformer, e.g. 0.24 0.24.",
+    )
+    parser.add_argument(
+        "--no_taylorseer",
+        action="store_true",
+        help="Disable the cache_dit TaylorSeer calibrator (enabled by default).",
+    )
+    parser.add_argument(
+        "--taylorseer_order",
+        type=int,
+        default=1,
+        help="cache_dit TaylorSeer expansion order.",
     )
 
     args = parser.parse_args()
@@ -219,7 +280,8 @@ def main():
 
     kwargs = {
         "use_habana": args.use_habana,
-        "use_hpu_graphs": args.use_hpu_graphs,
+        # torch.compile and HPU graphs are mutually exclusive graph paths; cache_dit needs the former.
+        "use_hpu_graphs": False if args.use_compile else args.use_hpu_graphs,
         "gaudi_config": gaudi_config,
     }
     if args.dtype == "bf16":
@@ -254,6 +316,29 @@ def main():
                 pipeline.transformer_2 = prepare(pipeline.transformer_2, config_2)
             elif config_2.quantize:
                 pipeline.transformer_2 = convert(pipeline.transformer_2, config_2)
+
+    # Enable cache_dit (DBCache) block caching after any FP8 convert. The two acceleration axes
+    # (FP8 quant + cache_dit) are orthogonal and compound.
+    if args.use_cache_dit:
+        pipeline.enable_cache_dit(
+            residual_diff_threshold=args.cache_threshold,
+            max_warmup_steps=args.cache_warmup,
+            Fn_compute_blocks=args.cache_fn_blocks,
+            use_taylorseer=not args.no_taylorseer,
+            taylorseer_order=args.taylorseer_order,
+            warmup_steps_per_transformer=args.cache_warmup_per_transformer,
+            thresholds_per_transformer=args.cache_threshold_per_transformer,
+        )
+
+    # torch.compile the transformer(s) after FP8 convert and cache_dit enable. Unlike HPU graphs,
+    # torch.compile(hpu_backend) tolerates cache_dit's per-step block-skip (graph breaks), so the two
+    # compose; it also recovers the eager-mode penalty.
+    if args.use_compile:
+        logger.info(f"torch.compile transformers (backend={args.compile_backend})")
+        if pipeline.transformer is not None:
+            pipeline.transformer = torch.compile(pipeline.transformer, backend=args.compile_backend)
+        if pipeline.transformer_2 is not None:
+            pipeline.transformer_2 = torch.compile(pipeline.transformer_2, backend=args.compile_backend)
 
     set_seed(args.seed)
 
